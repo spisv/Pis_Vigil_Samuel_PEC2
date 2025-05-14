@@ -1,0 +1,456 @@
+---
+title: "PEC2_Análisis_datos_ómicos"
+author: "Samuel Pis Vigil"
+date: "2025-05-08"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# Resumen
+En este Trabajo se realiza un análisis transcriptómico de la respuesta molecular humana al proceso infectivo por parte del virus del Covid-19 y se compara con la respuesta que se da en los procesos de neumonía bacteriana.
+Para ello se hace uso de un repositorio público (GSE161731, NCBI) que contiene los datos de secuenciación masiva de ARN de 77 muestras de sangre periférica de 46 pacientes con coronavirus y la comparación con datos de pacientes de una serie de otras enferemedades respiratorias y de controles sanos.
+
+
+# Objetivos
+El principal objetivo de este Trabajo es la identificación de las rutas moleculares que se vean alteradas por la infección por Covid-19 en pacientes humanos. 
+
+Los objetivos secundarios de este Trabajo son la identificación del conjunto de genes cuya expresión se ve alterada en pacientes humanos de Covid-19 y de infecciones bacterianas, comprobar si existe un solapamiento entre ambos grupos de genes y comparar las rutas moleculares que están exacerbadas en infecciones de neumonías bacterianas y de infecciones por Covid-19
+
+
+*NOTA* Hemos decidido organizar los contenidos de los apartados _Métodos_ y _Resultados_ de la siguiente manera. En _Métodos_ se explican los datos de origen, los paquetes usados y el método estadístico de reducción dimensional usado. En _Resultados_ se han ido dando, a parte de los resultados en sí mismos, explicaciones metodológicas en mayor detalle de algunos pasos. El motivo de incluir explicaciones metodológicas en el apartado _Resultados_ radica en que consideramos que es más entendible explicar los análisis conforme se van ejecutando que ponerlo todo junto al principio.
+
+
+# Métodos
+Los datos usados para este Trabajo están extraídos del repositorio público de datos _GSE161731_ del _Gene Expression Omnibus_ del NCBI, el cual contiene los datos de 77 muestras de RNAseq de sangre periférica de 46 pacientes con Covid-19, 59 muestras de pacientes de coronavirus estacional, 17 muestras de pacientes de influenza, 20 de pacientes de neumonía bacteriana y 19 controles sanos.
+
+Para realizar el trabajo se han usado, a parte del conjunto de paquetes de R cargados por defecto en Rstudio, una serie de librerías más específicas. Se ha usado el paquete _SummarizedExperiment_ para generar el objeto "SummarizedExperiment" que agrupa los datos y metadatos provenientes de los experimentos de RNAseq que engloba _GSE161731_. Para procesar y descomprimir los archivos descargados desde el NCBI se ha usado el paquete R.utils; para obtener los rangos genómicos de los transcritos se ha empleado el paquete _GenomicRanges_; para almacenar, interpretar y traducir los IDs de Ensembl asociados a las anotaciones de las lecturas y transcritos de ARN se ha empleado la librería _EnsDb.Hsapiens.v86_; para realizar el análisis de expresión diferencial se han usado los paquetes _edgeR_ y _limma_; finalmente, para la representación visual de los gráficos se ha empleado _ggplot2_ (paquete estándar de graficación), _ComplexHeatmap_ (para la realización de gráficos de mapas de calor), _circlize_ (en este caso se ha usado por ser auxiliar a _ComplexHeatmap_) y nVennR (para la realización de diagramas de Venn con conjuntos cuasi-proporcionales). Cabe destacar que se ha empleado _nVennR_ frente a otros paquetes más conocidos y extendidos de generación de diagramas de Venn (y más fáciles de descargar ya que se encuentran en CRAN y no es necesaria su instalación manual desde GitHub, como es el caso de _nVennR_) como _VennDiagram_ debido a que es el único que realiza representaciones cuasi-proporcionales de los conjuntos según el tamaño de las listas que forman dichos conjuntos, lo que da una imagen mucho más intuitiva e informativa de la realidad del diagrama.
+
+En cuanto a la metodología estadística empleada, cabe destacar que se ha empleado el método de Voom-Limma (se ha escogido siguiendo la directriz de pseudoaleaterización marcado en el enunciado de la PEC) para la realización del análisis de expresión diferencial. Este método realiza una transformación de Voom en primer lugar para poder, posteriormente, realizar un ajuste a un modelo lineal que permite extraer datos de FoldChange (indica en términos relativos cuánto varía la expresión de un gen) y de p-valor crudo y ajustado asociado a cada comparación de RNAseqs.
+
+
+# Resultados
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+library(SummarizedExperiment)
+library(R.utils)
+library(GenomicRanges)
+library(EnsDb.Hsapiens.v86)
+library(edgeR)
+library(nVennR)
+library(limma)
+library(ggplot2)
+library(ComplexHeatmap)
+library(circlize)
+library(gprofiler2)
+```
+
+## Generación del _SummarizedExperiment_
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+url_counts <- "ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE161nnn/GSE161731/suppl/GSE161731_counts.csv.gz"
+url_key    <- "ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE161nnn/GSE161731/suppl/GSE161731_key.csv.gz"
+dir.create("data", showWarnings=FALSE)
+curl::curl_download(url_counts, destfile="data/GSE161731_counts.csv.gz", mode="wb")
+curl::curl_download(url_key,    destfile="data/GSE161731_key.csv.gz",    mode="wb")
+
+counts   <- read.csv(gzfile("data/GSE161731_counts.csv.gz"),
+                     row.names=1, check.names=FALSE)
+col_data <- read.csv(gzfile("data/GSE161731_key.csv.gz"),
+                     row.names=1)                         
+
+edb         <- EnsDb.Hsapiens.v86
+gene_ranges <- genes(edb)                                
+
+# Normalización IDs Ensembl
+rownames(counts) <- sub("\\.\\d+$", "", rownames(counts))
+mcols(gene_ranges)$gene_id <- sub("\\.\\d+$", "", mcols(gene_ranges)$gene_id)
+
+# Filtrado y reordenamiento de genes y muestras
+common_samples <- intersect(colnames(counts), rownames(col_data))
+counts   <- counts[, common_samples, drop=FALSE]
+col_data <- col_data[common_samples, , drop=FALSE]
+
+common_genes  <- intersect(rownames(counts), mcols(gene_ranges)$gene_id)
+counts        <- counts[common_genes, , drop=FALSE]
+gene_ranges  <- gene_ranges[ match(common_genes, mcols(gene_ranges)$gene_id) ]
+
+names(gene_ranges)   <- mcols(gene_ranges)$gene_id
+rownames(col_data)   <- colnames(counts)
+
+# Construcción del SummarizedExperiment
+counts_mat <- as.matrix(counts) 
+se <- SummarizedExperiment(
+  assays    = SimpleList(counts = counts_mat),
+  rowRanges = gene_ranges,
+  colData   = col_data
+)
+
+```
+
+Tras descargar los datos desde el NCBI y generar el objeto _SummarizedExperiment_ (al que hemos llamad0 _se_) se comprueba si se ha creado correctamente.
+```{r}
+
+# Comprobación de que se ha hecho bien el se
+dim(se)                                   
+identical(rownames(se), names(rowRanges(se)))
+identical(colnames(se), rownames(colData(se)))
+```
+Se verifica que nombres de las muestras y los genes son iguales y están alineados entre los datos y los metadatos (si no da errores _a posteriori_). Por otra parte, se tiene que en los datos hay 57.602 genes y 195 muestras; el número de muestras coincide con lo expresado en la descripción del dataset en GEO, y el número de genes está en el rango más o menos normal para un conjunto de datos de RNAseq.
+
+## Limpieza de los datos y selección pseudoaleatoria de muestras
+
+Para la selección pseudoaleatoria del conjunto de muestras seguimos el plante de semilla indicado en el enunciado de la PEC:
+```{r}
+myseed <- sum(utf8ToInt("samuelpisvigil"))
+set.seed(myseed)
+```
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+md <- col_data
+md <- md[ md$cohort %in% c("COVID-19", "Bacterial", "healthy"), ]
+
+# Eliminación de duplicados y conversión de variables
+md <- md[ !duplicated(md$subject_id), ]
+if(!is.numeric(md$age)) {
+  md$age <- as.numeric(md$age)
+}
+names(md) <- gsub("[ \\-\\/]+", "_", names(md))
+
+# Selección de muestras
+chosen <- sample(rownames(md), size = 75)
+md75   <- md[chosen, ]
+
+# Generación del SummarizedExperiment de las 75 muestras
+se75 <- se[, colnames(se) %in% chosen]
+md75_df <- DataFrame(md75)
+colData(se75) <- md75_df
+```
+
+Para comprbar si el nuevo objeto se ha generado correctamente, se comprueba en un vistazo que los datos se correspondan solo a cohortes de "COVID_19", "healthy" y "Bacterial". También se comprueba que ninguna columna se haya corrompido en el proceso intermedio y que el número de genes siga siendo 57.602 y el número de muestras 75:
+```{r}
+# Comprobación de que "se75" es correcto
+colData(se75)
+dim(se75)
+```
+## Preprocesado inicial de los datos
+
+En el preprocesado inicial de los datos . También se normalizan los datos restantes y se realiza una trasformación logarítmica a los conteos por millón (CPM) para manejarlos mejor en los posteriores análisis sin perder la representatividad de estos. De manera arbitraria, hemos escogido como límite defiltrado que un gen tenga más de 1 CPM en al menos la mitad de las muestras.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+dge <- DGEList(counts=assay(se75, "counts"), samples=colData(se75))
+keep <- rowSums(cpm(dge) > 1) >= (ncol(dge)/2)
+dge <- dge[keep, , keep.lib.sizes=FALSE]
+dge <- calcNormFactors(dge)
+logCPM <- cpm(dge, log=TRUE, prior.count=0.5)
+filtered_genes <- rownames(logCPM)
+se_filt <- se75[filtered_genes, ]
+
+assay(se_filt, "logCPM") <- logCPM
+```
+
+Comprobamos que se ha añadido correctamente el assay filtrado al nuevo objeto _se_ y echamos un ojo al número de genes que quedan tras el filtrado
+```{r}
+assays(se_filt)
+dim(se_filt)
+```
+El número de genes se ha reducido muy notablemente desde 57.602 hasta 13.592.
+
+## Análisis exploratorio
+
+Para realizar un análisis exploratorio de los datos en primer lugar vamos a hacer dos análisis de reducción dimensional, uno mediante el método MDS y otro mediante el método PCA. Como ambos análisis nos permiten discernir en las graficaciones dos tipos de información en la representación de cada punto (una mediante su color y otro mediante su forma) hemos decidido que se representen la cohorte (para ver si se agrupan las muestras dependiendo de si provienen de individuos sanos o de pacientes con neumonía bacteriana o covid) y el batch (para ver si hay un _batch effect_ claro en los gráficos). Hemos decidido representar el batch y no cualquier otra variable que pudiera ser confusora porque la observación de un _batch effect_ nos indicaría un sesgo técnico que habría que atajar antes de continuar con los análisis
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+md <- as.data.frame(colData(se_filt))
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+# Calcula distancia de muestras (usando dist sobre transpuesta de logCPM)
+d <- dist(t(logCPM))
+mds <- cmdscale(d, k = 2)
+mds_df <- data.frame(MDS1 = mds[,1],
+                     MDS2 = mds[,2],
+                     md)
+
+ggplot(mds_df, aes(MDS1, MDS2, color = cohort, shape = factor(batch))) +
+  geom_point(size = 3) +
+  labs(title="MDS sobre logCPM", x="Dim 1", y="Dim 2") +
+  theme_minimal()
+
+```
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+pca <- prcomp(t(logCPM), scale.=TRUE)
+pca_df <- data.frame(PC1 = pca$x[,1],
+                     PC2 = pca$x[,2],
+                     md)
+
+ggplot(pca_df, aes(PC1, PC2, color = batch, shape = cohort)) +
+  geom_point(size = 3) +
+  labs(title="PCA sobre logCPM", x="PC1", y="PC2") +
+  theme_minimal()
+
+```
+Como sepuede observar, ni en la graficación del MDS ni en la del PCA se observan claras agrupaciones en torno a la variable de la cohorte ni del batch. Esto nos indicaría que no hay un _batch effect_ muy aparente en las muestras y que no existen diferencias lo suficientemente generalizadas en los perfiles transcriptómicos de los pacientes de las dos enfermedades y en los controles sanos como para observarlas con una reducción dimensional.
+
+Otra aproximación sería realizar un heatmap con dendrograma asociado para comprobar si las muestras se agrupan entre sí. La idea de fondo es similar a la de los dos gráficos anteriores, comprobar si la expresión transcriptómica general de las muestras es suficientemente diferencial como para distinguirlas entre sí previamente a un análisis de expresión diferencial _per se_. La diferencia es que antes hemos usado dos aproximaciones de reducción dimensional y ahora usaremos un enfoque de agrupación jerárquica.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+md$cohort <- factor(md$cohort,
+                    levels = c("healthy","Bacterial","COVID.19"))
+levels(md$cohort)
+
+cohort_colors <- setNames(
+  c("green", "orange", "grey"),
+  levels(md$cohort)                   
+)
+
+ha <- HeatmapAnnotation(
+  df = md[, c("cohort","batch")],
+  col = list(
+    cohort = cohort_colors
+  )
+)
+
+dist_mat <- as.matrix(d)
+Heatmap(
+  dist_mat,
+  name              = "Distancia",
+  top_annotation    = ha,
+  show_row_names    = FALSE,
+  show_column_names = FALSE
+)
+
+```
+Como se puede observar en el dendrograma asociado al heatmap, no existe a simple vista una agrupación demasiado clara entre muestras de la misma cohorte ni con el mismo batch. 
+
+
+A simple vista parece que el batch no está actuando como una variable confusora, es decir, parece ser que no hay un _batch effect_. Para analizar matemáticamente si hay variables confusoras vamos a realizar el siguiente procedimiento: en primer lugar identificaremos y eliminaremos los outliers, poniendo como definición de outlier aquel punto que esté más allá del doble de la desviación estándar en el PC1 y/o el PC2 del PCA. Una vez eliminados realizaremos un análisis de correlación entre el PC1 y las variables que son candidatas a ser confusoras. Elegimos hacer la correlación solo con el PC1 porque es el componente que explica una mayor proporción de la variabilidad de las muestras, por lo que deducimos que de haber efecto confusor este se mostraría con mayor claridad en el primer componente principal. De entre todo el conjunto de datos hemos elegido como variables candidatas a ser confusoras el batch, la edad, el sexo y la raza. Se han escogido la raza, el sexo y la edad por ser las variables no técnicas que, en términos generales, generan una mayor variabilidad biológica entre individuos; por otra parte, se incluye el batch para cercionarnos de que efectivamente no hay un _batch effect_.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+# Definición y eliminación de outliers
+threshold       <- 2 * sd(pca$x[,1])
+outliers_idx    <- which(abs(pca$x[,1]) > threshold)
+sample_outliers <- rownames(pca$x)[outliers_idx]
+
+if (length(sample_outliers) > 0) {
+  keep_samples <- setdiff(colnames(se_filt), sample_outliers)
+} else {
+  keep_samples <- colnames(se_filt)
+}
+
+se_expl        <- se_filt[, keep_samples]
+logCPM_expl    <- logCPM[, keep_samples, drop = FALSE]
+md_expl        <- as.data.frame(colData(se_filt))[keep_samples, , drop = FALSE]
+
+# Recodificación de la raza
+race_levels <- c(
+  "White",
+  "Black/African American",
+  "Asian",
+  "Native Hawaiian/Pacific Islander",
+  "Unknown/Not reported"
+)
+md_expl$race_fct <- factor(md_expl$race, levels = race_levels)
+md_expl$race_num <- as.numeric(md_expl$race_fct)
+
+# Recodificación del sexo
+md_expl$gender_fct <- factor(md_expl$gender, levels = c("Female", "Male"))
+md_expl$gender_num <- as.numeric(md_expl$gender_fct) - 1
+
+# Análisis de correlaciones entre variables candidatas a ser confusoras y PC1
+for (var in c("batch", "race_num", "age", "gender_num")) {
+  if (var %in% colnames(md_expl) && is.numeric(md_expl[[var]])) {
+    # pares completos entre PC1 y la variable
+    pc1_vals  <- pca$x[keep_samples, 1]
+    meta_vals <- md_expl[[var]]
+    valid     <- complete.cases(pc1_vals, meta_vals)
+    cor_val   <- cor(pc1_vals[valid],
+                     meta_vals[valid],
+                     use = "complete.obs")
+    cat(var, "vs PC1 correlation:", round(cor_val, 2), "\n")
+  } else if (var %in% colnames(md_expl)) {
+    cat("Variable", var, "no es numérica, omitiendo cor()\n")
+  }
+}
+
+pca_df <- data.frame(
+  PC1      = pca$x[keep_samples, 1],
+  PC2      = pca$x[keep_samples, 2],
+  race_num = factor(md_expl$race_num)
+)
+```
+Se observa que no existe apenas correlación entre el sexo y el PC1 y el batch y el PC1. La correlación entre edad y PC1 es algo mayor pero sigue siendo baja. En cuanto a la correlación de raza y PC1, el coeficiente de correlación es ya algo mayor, de -0,22, lo que indica la presencia de una correlación negativa y débil. Aunque sea débil, es un efecto notablemente mayor al que ejercen el resto de variables candidatas a ser confusoras.
+
+Para observar visualmente este efecto podemos volver a representar el gráfico PCA pero esta vez plasmando la pertenencia a cada raza
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+ggplot(pca_df, aes(PC1, PC2, color = race_num)) +
+  geom_point(size = 3) +
+  scale_color_brewer(palette = "Set1", name = "Race code") +
+  labs(title = "PCA coloreado por raza", x = "PC1", y = "PC2") +
+  theme_minimal()
+```
+A simple vista no se observa el efecto confusor. No obstante, debido a su coeficiente de correlación incluiremos a la variable _raza_ dentro de la matriz de diseño.
+
+
+## Análisis de expresión diferencial
+
+Para construir la matriz de diseño y evaluar expresión génica diferencial de _Bacterial_ frente a _Healthy_ y de _Covid_ frente a _Healthy_ vamos utilizar el método que se elija de manera pseudoaleatoria por el código del enunciado de la PEC:
+```{r}
+set.seed(myseed) 
+sample(c("edgeR", "voom+limma", "DESeq2"), size = 1)
+```
+En este caso vamos a usar el método voom+limma.
+
+*NOTA* En el modelo que hemos calculado no salía ningún gen diferencialmente expresado si poníamos como umbrales o 0,05 de p-valor ajustado y 1,5 de log2FC. Para poder continuar con los análisis de la PEC hemos usado como umbral el p-valor crudo, no el ajustado, para que así haya genes a analizar. Esto no es lo correcto (somos conscientes de ello), se debería usar el valor ajustado, pero de esta manera podemos continuar con un análisis de expresión diferencial.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+# Preparar el objeto DGEList
+dge <- DGEList(counts = assay(se_expl, "counts"))
+dge <- calcNormFactors(dge)
+md_de <- as.data.frame(colData(se_expl))
+
+# Recodificar las variables
+md_de$cohort <- factor(md_de$cohort, levels = c("healthy", "Bacterial", "COVID-19"))
+levels(md_de$cohort) <- make.names(levels(md_de$cohort))
+md_de$race <- factor(md_de$race)
+levels(md_de$race) <- make.names(levels(md_de$race))
+
+# Construir la matriz de diseño
+design <- model.matrix(~ 0 + cohort + race, data = md_de)
+
+
+common_samples <- intersect(colnames(se_expl), rownames(design))
+se_expl <- se_expl[, common_samples]
+design  <- design[common_samples, ]
+
+
+# Definir de los contrastes
+cont.matrix <- makeContrasts(
+  Bact_vs_Healthy  = cohortBacterial - cohorthealthy,
+  COVID_vs_Healthy = cohortCOVID.19 - cohorthealthy,
+  levels = design
+)
+
+common_samples <- intersect(colnames(dge), rownames(design))
+dge <- dge[, common_samples]
+design <- design[common_samples, ]
+
+
+# Aplicar la transformación voom y realizar elmodelo
+v <- voom(dge, design, plot = FALSE)
+fit <- lmFit(v, design)
+fit2 <- contrasts.fit(fit, cont.matrix)
+fit2 <- eBayes(fit2)
+
+# Obtener los resultados para el contraste Bact_vs_Healthy
+tt_bact <- topTable(fit2, coef = "Bact_vs_Healthy", adjust = "BH", number = Inf)
+
+# Obtener los resultados para el contraste COVID_vs_Healthy
+tt_covid <- topTable(fit2, coef = "COVID_vs_Healthy", adjust = "BH", number = Inf)
+
+# Filtrar genes diferencialmente expresados con log2FC > 1.5 y p valor < 0.05
+deg_bact <- subset(tt_bact, abs(logFC) > log2(1.5) & P.Value < 0.05)
+deg_covid <- subset(tt_covid, abs(logFC) > log2(1.5) & P.Value < 0.05)
+cat("Genes DE en Bacterial vs Healthy:", nrow(deg_bact), "\n")
+cat("Genes DE en COVID-19 vs Healthy:", nrow(deg_covid), "\n")
+
+```
+Así pues, tendríamos un total de 497 genes diferencialmente expresados entre bacterial y healthy un un total de 427 genes diferencialmente expresados entre Covid y healthy.
+
+Para comprobar hasta qué punto estos genes diferencialmente expresados podrían ser comunes en ambas comparaciones podemos realizar un diagrama de Venn y ver hasta qué punto solapan ambos conjuntos. Un gran solapamiento nos podría indicar que los genes cuya transcripción se ve más alterada en ambos casos podrían pertenecer a vías moleculares generales relacionadas con la respuesta inmunitaria o la respuesta a daño intracelular, ambas relacionadas con procesos infectivos.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, fig.dpi=600}
+# Extrayendo como vector de caracteres
+genes_bact <- rownames(deg_bact)
+genes_covid <- rownames(deg_covid)
+
+# Convertir ese vector en una lista (cada elemento un ID)
+lista_genes_bact <- as.list(genes_bact)
+lista_genes_covid <- as.list(genes_covid)
+myV <- plotVenn(list(Bacterial=lista_genes_bact, Covid=lista_genes_covid))
+```
+
+
+## Análisis funcional
+
+Para realizar un análisis funcional de los genes diferencialmente expresados vamos a obtener los términos GO compartidos por los genes de cada comparativa y los vamos a ordenar en base a su p-valor asociado. Vamos a ranquear los diez términos GO más significativos por comparativa.
+
+### Términos GO Covid vs Healthy
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+genes_covid_ens <- rownames(subset(tt_covid, logFC > log2(1.5) & P.Value < 0.05))
+
+gost_covid <- gost(query            = genes_covid_ens,
+                   organism         = "hsapiens",
+                   sources          = "GO:BP",
+                   user_threshold   = 0.05,
+                   correction_method= "fdr",
+                   domain_scope     = "annotated")
+
+head(gost_covid$result[, c("term_id","term_name","p_value","intersection_size")], 10)
+```
+En el caso del Covid se observa que las rutas más alteradas están relacionadas con la trascirpción, el transporte intracelular (en particular el endosomal), la transducción de señales y los procesos metabólicos de compuestos fosfatados.
+
+### Términos GO Covid vs Healthy
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+genes_bact_ens  <- rownames(subset(tt_bact,  logFC > log2(1.5) & P.Value < 0.05))
+
+gost_bact  <- gost(query            = genes_bact_ens,
+                   organism         = "hsapiens",
+                   sources          = "GO:BP",
+                   user_threshold   = 0.05,
+                   correction_method= "fdr",
+                   domain_scope     = "annotated")
+
+head(gost_bact$result[,  c("term_id","term_name","p_value","intersection_size")], 10)
+```
+En cuanto a la infección bacteriana, los procesos más alterados tienen que ver con la transducción de señales, los procesos metabólicos primarios y el transporte vascular.
+
+
+# Discusión
+
+En base a los resultados podemos deducir varias cuestiones de interés. En primer lugar que en lo que respecta a la respuesta biológica a nivel transcritómico a infecciones bacterianas y por Covid existe poca influencia de factores como el sexo y la edad, tal y como se puso de manifiesto en el análisis de correlación. A este respecto cabe señalar que, aunque la influencia sea estadísticamente pequeña en el nivel trnascriptómico, a nivel tisular y de organismo estas pequeñas diferencias pueden tener consecuencias importantes.
+
+De igual manera, la no agrupación de manera nítida de las muestras por cohorte en los análisis de reducción dimensional y agrupamiento jerárquico nos indica que las infecciones bacterianas y por covid no estarían produciendo cambios transcriptómicos a gran escala, al menos no lo suficientemente fuertes como para separar los grupos en dichos análisis.
+
+Finalmente, del análisis funcional de los genes diferencialmente transcritos cabe destacar que en el caso de la infección por Covid se ven alteradas preferencialmente las vías de transducción de señales y de transporte intracelular, mientras que en la infección bacteriana se alteran los procesos metabólicos primarios, el transporte vascular y la transducción de señales. Conviene resaltar que en ambas comparaciones resulta alterada la vía de transducción de señales mediada por GTP-asas pequeñas
+
+
+# Conclusiones
+
+*1* La edad y el sexo son variables que afectan poco a la respuesta transcriptómica frente a la infección por Covid y la neumonía bacteriana
+
+*2* Ambos tipos de infección no generan respuestas transcriptómicas generalizadas y a gran escala al menos en muestras de sangre periférica
+
+*3* Las vías preferencialmente alteradas en ambas infecciones están relacionadas con la transducción de señales. En el caso del Covid se añadiría el transporte intracelular y en el caso de la infección bacteriana los procesos metabólicos primarios y el trasporte vascular.
+
+# Referencias
+
+Hemos decidido subir el código de esta PEC en formato Rmarkdown para facilitar su lectura. Para acceder a él se ha de visitar el siguiente repositorio de GitHub: https://github.com/spisv/Pis_Vigil_Samuel_PEC2
+
+## Artículos científicos
+
+Dyer, S. C., Austine-Orimoloye, O., Azov, A. G., Barba, M., Barnes, I., Barrera-Enriquez, V. P., Becker, A., Bennett, R., Beracochea, M., Berry, A., Bhai, J., Bhurji, S. K., Boddu, S., Branco Lins, P. R., Brooks, L., Ramaraju, S. B., Campbell, L. I., Martinez, M. C., Charkhchi, M., Cortes, L. A., … Yates, A. D. (2025). Ensembl 2025. Nucleic acids research, 53(D1), D948–D957. https://doi.org/10.1093/nar/gkae1071
+
+
+Pérez-Silva, J. G., Araujo-Voces, M., & Quesada, V. (2018). nVenn: generalized, quasi-proportional Venn and Euler diagrams. Bioinformatics (Oxford, England), 34(13), 2322–2324. https://doi.org/10.1093/bioinformatics/bty109
+
+## Tutoriales web
+
+https://web.mit.edu/~r/current/arch/i386_linux26/lib/R/library/GenomicRanges/doc/GenomicRangesIntroduction.pdf
+
+https://aspteaching.github.io/Analisis_de_datos_omicos-Ejemplo_2-RNASeq/Workflow_basico_de_RNASeq.html#7_An%C3%A1lisis_de_expresi%C3%B3n_diferencial_con_limma-voom
+
+https://aspteaching.github.io/AMVCasos/#an%C3%A1lisis-de-componentes-principales
+
+https://jokergoo.github.io/ComplexHeatmap-reference/book/
